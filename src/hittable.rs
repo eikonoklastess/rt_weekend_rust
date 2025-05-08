@@ -1,10 +1,11 @@
 use crate::rtweekend::*;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct HitRecord {
     pub p: Point3,
     pub normal: Vec3,
     pub t: f64,
+    pub mat: Arc<dyn Material + Send + Sync>,
     pub front_face: bool,
 }
 
@@ -17,6 +18,19 @@ impl HitRecord {
         } else {
             -outward_normal
         };
+    }
+}
+
+impl Default for HitRecord {
+    fn default() -> Self {
+        Self {
+            p: Point3::default(),    // or Point3::zero()
+            normal: Vec3::default(), // or Vec3::zero()
+            t: 0.0,
+            // Use your placeholder material for the default
+            mat: Arc::new(NullMaterial),
+            front_face: false,
+        }
     }
 }
 

@@ -3,11 +3,16 @@ use crate::rtweekend::*;
 pub struct Sphere {
     pub center: Point3,
     pub radius: f64,
+    pub mat: Arc<dyn Material + Send + Sync>,
 }
 
 impl Sphere {
-    pub fn new(center: Point3, radius: f64) -> Self {
-        Self { center, radius }
+    pub fn new(center: Point3, radius: f64, mat: Arc<dyn Material + Send + Sync>) -> Self {
+        Self {
+            center,
+            radius,
+            mat,
+        }
     }
 }
 
@@ -39,6 +44,7 @@ impl Hittable for Sphere {
         rec.normal = (rec.p - self.center) / self.radius;
         let outward_normal = (rec.p - self.center) / self.radius;
         rec.set_face_normal(r, outward_normal);
+        rec.mat = self.mat.clone();
 
         Some(rec)
     }

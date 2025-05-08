@@ -106,8 +106,10 @@ impl Camera {
         let hit_interval = Interval::new(0.001, INFINITY);
 
         if let Some(rec) = world.hit(r, Interval::new(hit_interval.min, hit_interval.max)) {
-            let direction = rec.normal + Vec3::random_unit_vector(); //Vec3::random_on_hemisphere(&rec.normal);
-            return 0.5 * self.ray_color(&Ray::new(rec.p, direction), depth - 1, world);
+            if let Some((scattered, attenuation)) = rec.mat.scatter(r, &rec) {
+                return attenuation * self.ray_color(&scattered, depth - 1, world);
+            }
+            return Color::zero();
         }
 
         // If no hit, it's the background (sky gradient)
