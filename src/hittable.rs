@@ -29,7 +29,7 @@ impl Default for HitRecord {
             t: 0.0,
             // Use your placeholder material for the default
             mat: Arc::new(NullMaterial),
-            front_face: false,
+            front_face: true, //false,
         }
     }
 }

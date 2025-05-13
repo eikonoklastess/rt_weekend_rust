@@ -1,0 +1,1085 @@
+=== camera.rs ===
+use crate::rtweekend::*;
+use rayon::prelude::*;
+use std::fs::File;
+use std::io::BufWriter;
+use std::io::{self, Write};
+
+pub struct Camera {
+    pub aspect_ratio: f64,
+    pub image_width: u32,
+    pub samples_per_pixel: u32,
+    pub max_depth: u32,
+    pub vfov: f64,
+    pub lookfrom: Point3,
+    pub lookat: Point3,
+    pub vup: Vec3,
+    pub defocus_angle: f64,
+    pub focus_dist: f64,
+
+    u: Vec3,
+    v: Vec3,
+    w: Vec3,
+    pixel_sample_scale: f64,
+    image_height: u32,
+    center: Point3,
+    pixel00_loc: Point3,
+    pixel_delta_u: Vec3,
+    pixel_delta_v: Vec3,
+    defocus_disk_u: Vec3,
+    defocus_disk_v: Vec3,
+}
+
+impl Camera {
+    pub fn new(
+        aspect_ratio: f64,
+        image_width: u32,
+        samples_per_pixel: u32,
+        max_depth: u32,
+        vfov: f64,
+        lookfrom: Point3,
+        lookat: Point3,
+        vup: Vec3,
+        defocus_angle: f64,
+        focus_dist: f64,
+    ) -> Self {
+        let mut cam = Self {
+            aspect_ratio,
+            image_width,
+            samples_per_pixel,
+            max_depth,
+            vfov,
+            lookfrom,
+            lookat,
+            vup,
+            defocus_angle,
+            focus_dist,
+            u: Point3::default(),
+            v: Point3::default(),
+            w: Point3::default(),
+            pixel_sample_scale: 1.0 / samples_per_pixel as f64,
+            image_height: 0,
+            center: Point3::default(),
+            pixel00_loc: Point3::default(),
+            pixel_delta_u: Vec3::default(),
+            pixel_delta_v: Vec3::default(),
+            defocus_disk_u: Vec3::default(),
+            defocus_disk_v: Vec3::default(),
+        };
+        cam.initialize();
+        cam
+    }
+
+    pub fn initialize(&mut self) {
+        self.image_height = (self.image_width as f64 / self.aspect_ratio)
+            .round()
+            .max(1.0) as u32;
+        //self.lookfrom = Point3::zero();
+        //self.lookat = Point3::new(0.0, 0.0, -1.0);
+        //self.vup = Vec3::new(0.0, 1.0, 0.0);
+        self.center = self.lookfrom;
+
+        let theta = degrees_to_radians(self.vfov);
+        let h = (theta / 2.0).tan();
+        let viewport_height = 2.0 * h * self.focus_dist;
+        let viewport_width =
+            viewport_height * ((self.image_width as f64) / (self.image_height as f64));
+
+        self.w = (self.lookfrom - self.lookat).normalized();
+        self.u = self.vup.cross(self.w).normalized();
+        self.v = self.w.cross(self.u);
+
+        let viewport_u = viewport_width * self.u;
+        let viewport_v = viewport_height * -self.v;
+
+        self.pixel_delta_u = viewport_u / (self.image_width as f64);
+        self.pixel_delta_v = viewport_v / (self.image_height as f64);
+
+        let viewport_upper_left = self.center
+            - self.focus_dist * self.w
+            - viewport_u / 2.0                     // Move to left edge
+            - viewport_v / 2.0; // Move to top edge (since viewport_v is downwards)
+
+        self.pixel00_loc = viewport_upper_left + 0.5 * (self.pixel_delta_u + self.pixel_delta_v);
+
+        let defocus_radius = self.focus_dist * degrees_to_radians(self.defocus_angle / 2.0).tan();
+        self.defocus_disk_u = self.u * defocus_radius;
+        self.defocus_disk_v = self.v * defocus_radius;
+    }
+    /*
+    pub fn render<W: Hittable>(&self, world: &W) -> io::Result<()> {
+        let mut stdout_buffer = io::BufWriter::new(io::stdout().lock());
+        writeln!(stdout_buffer, "P3")?;
+        writeln!(stdout_buffer, "{} {}", self.image_width, self.image_height)?;
+        writeln!(stdout_buffer, "255")?;
+
+        let mut stderr = io::stderr();
+
+        for j in 0..self.image_height {
+            // Progress indicator
+            if j % 20 == 0 || j == self.image_height - 1 {
+                // Update less frequently
+                eprint!("\rScanlines remaining: {:<4}", self.image_height - 1 - j);
+                stderr.flush()?;
+            }
+
+            for i in 0..self.image_width {
+                let mut pixel_color = Color::zero();
+                for _sample in 0..self.samples_per_pixel {
+                    let r = self.get_ray(i, j);
+                    pixel_color += self.ray_color(&r, self.max_depth, world);
+                }
+
+                write_color(&mut stdout_buffer, pixel_color * self.pixel_sample_scale)?;
+            }
+        }
+
+        eprintln!("\rDone.                          ");
+        stderr.flush()?;
+        // stdout_buffer flushes on drop
+
+        Ok(())
+    }
+    */
+    pub fn render<W: Hittable + Sync>(&self, world: &W) -> io::Result<()> {
+        // `world` needs to be Sync because it's accessed by multiple threads.
+        // `self` is also accessed by multiple threads (for its methods and fields),
+        // so Camera itself needs to be Sync (which it should be if its fields are).
+
+        let num_pixels = (self.image_width * self.image_height) as usize;
+
+        // --- Start of logging ---
+        eprintln!("Starting parallel render...");
+        eprintln!(
+            "Image Dimensions: {}x{}",
+            self.image_width, self.image_height
+        );
+        eprintln!("Samples per pixel: {}", self.samples_per_pixel);
+        eprintln!("Max depth: {}", self.max_depth);
+        // --- End of logging ---
+
+        // Calculate all pixel colors in parallel
+        let pixel_colors: Vec<Color> = (0..num_pixels)
+            .into_par_iter() // Convert range to parallel iterator
+            .map(|pixel_idx| {
+                // Calculate (i, j) from the flat pixel_idx
+                // These are the logical pixel coordinates (0 to width-1, 0 to height-1)
+                let i = (pixel_idx % self.image_width as usize) as u32;
+                // For PPM, j=0 is the top row.
+                // If pixel_idx=0 is top-left, then j = (pixel_idx / self.image_width as usize) as u32;
+                // maps correctly.
+                let j_for_ray = (pixel_idx / self.image_width as usize) as u32;
+
+                let mut accumulated_color = Color::zero();
+                for _sample in 0..self.samples_per_pixel {
+                    let r = self.get_ray(i, j_for_ray); // Use the logical j for ray generation
+                    accumulated_color += self.ray_color(&r, self.max_depth, world);
+                }
+                accumulated_color * self.pixel_sample_scale
+            })
+            .collect(); // Collect results into a Vec
+
+        eprintln!("\nParallel computation finished. Writing to output...");
+
+        // Write to stdout (or a file) sequentially
+        let mut output_buffer = BufWriter::new(io::stdout().lock()); // Or File::create for file output
+        // If writing to a file, e.g., "image.ppm":
+        // let mut output_buffer = BufWriter::new(File::create("image.ppm")?);
+
+        writeln!(output_buffer, "P3")?;
+        writeln!(output_buffer, "{} {}", self.image_width, self.image_height)?;
+        writeln!(output_buffer, "255")?;
+
+        // Iterate through the collected pixel_colors and write them out.
+        // PPM writes rows from top to bottom.
+        // Our pixel_colors Vec is ordered such that pixel_colors[0] is pixel (0,0) [top-left],
+        // pixel_colors[1] is (1,0), ..., pixel_colors[width-1] is (width-1,0),
+        // pixel_colors[width] is (0,1), etc.
+        for pixel_color in pixel_colors {
+            write_color(&mut output_buffer, pixel_color)?;
+        }
+
+        output_buffer.flush()?; // Ensure all data is written
+        eprintln!("\nDone. Output complete.");
+
+        Ok(())
+    }
+
+    fn ray_color<W: Hittable>(&self, r: &Ray, depth: u32, world: &W) -> Color {
+        // Define the interval for valid hits. Use a small t_min to avoid self-intersection.
+        if depth <= 0 {
+            return Color::zero();
+        }
+
+        let hit_interval = Interval::new(0.001, INFINITY);
+
+        if let Some(rec) = world.hit(r, hit_interval) {
+            if let Some((scattered, attenuation)) = rec.mat.scatter(r, &rec) {
+                return attenuation * self.ray_color(&scattered, depth - 1, world);
+            }
+            return Color::zero();
+        }
+
+        // If no hit, it's the background (sky gradient)
+        let unit_direction = r.dir.normalized();
+        let a = 0.5 * (unit_direction.y + 1.0); // Using public field .y
+        (1.0 - a) * Color::new(1.0, 1.0, 1.0) + a * Color::new(0.5, 0.7, 1.0)
+    }
+
+    pub fn get_ray(&self, i: u32, j: u32) -> Ray {
+        let offset = self.sample_square();
+        let pixel_sample = self.pixel00_loc
+            + ((i as f64 + offset.x) * self.pixel_delta_u)
+            + ((j as f64 + offset.y) * self.pixel_delta_v);
+        let ray_origin = if self.defocus_angle <= 0.0 {
+            self.center
+        } else {
+            self.defocus_disk_sample()
+        };
+        let ray_direction = pixel_sample - ray_origin;
+
+        Ray::new(ray_origin, ray_direction)
+    }
+
+    fn sample_square(&self) -> Vec3 {
+        if self.samples_per_pixel == 1 {
+            return Vec3::zero();
+        }
+        Vec3::new(random_f64() - 0.5, random_f64() - 0.5, 0.0)
+    }
+
+    fn defocus_disk_sample(&self) -> Point3 {
+        let p = Vec3::random_in_unit_disk();
+        self.center + (p.x * self.defocus_disk_u) + (p.y * self.defocus_disk_v)
+    }
+}
+-e 
+
+=== color.rs ===
+use crate::rtweekend::*;
+use std::io::{self, Write};
+
+pub type Color = Vec3;
+
+#[inline]
+pub fn linear_to_gamma(linear_component: f64) -> f64 {
+    if linear_component > 0.0 {
+        linear_component.sqrt()
+    } else {
+        0.0
+    }
+}
+
+pub fn write_color<W: Write>(out: &mut W, pixel_color: Color) -> io::Result<()> {
+    let mut r = pixel_color.x;
+    let mut g = pixel_color.y;
+    let mut b = pixel_color.z;
+
+    r = linear_to_gamma(r);
+    g = linear_to_gamma(g);
+    b = linear_to_gamma(b);
+
+    let intensity = Interval::new(0.000, 0.999);
+    let rbyte = (255.999 * intensity.clamp(r)) as u8;
+    let gbyte = (255.999 * intensity.clamp(g)) as u8;
+    let bbyte = (255.999 * intensity.clamp(b)) as u8;
+
+    write!(out, "{} {} {}\n", rbyte, gbyte, bbyte)?;
+
+    Ok(())
+}
+-e 
+
+=== hittable.rs ===
+use crate::rtweekend::*;
+
+#[derive(Clone)]
+pub struct HitRecord {
+    pub p: Point3,
+    pub normal: Vec3,
+    pub t: f64,
+    pub mat: Arc<dyn Material + Send + Sync>,
+    pub front_face: bool,
+}
+
+impl HitRecord {
+    #[inline]
+    pub fn set_face_normal(&mut self, r: &Ray, outward_normal: Vec3) {
+        self.front_face = r.dir.dot(outward_normal) < 0.0;
+        self.normal = if self.front_face {
+            outward_normal
+        } else {
+            -outward_normal
+        };
+    }
+}
+
+impl Default for HitRecord {
+    fn default() -> Self {
+        Self {
+            p: Point3::default(),    // or Point3::zero()
+            normal: Vec3::default(), // or Vec3::zero()
+            t: 0.0,
+            // Use your placeholder material for the default
+            mat: Arc::new(NullMaterial),
+            front_face: true, //false,
+        }
+    }
+}
+
+pub trait Hittable: Send + Sync {
+    fn hit(&self, r: &Ray, ray_t: Interval) -> Option<HitRecord>;
+}
+-e 
+
+=== hittable_list.rs ===
+use crate::rtweekend::*;
+use std::vec::Vec;
+
+#[derive(Default)]
+pub struct HittableList {
+    pub objects: Vec<Arc<dyn Hittable>>,
+}
+
+impl HittableList {
+    pub fn new() -> Self {
+        Self {
+            objects: Vec::new(),
+        }
+    }
+
+    pub fn new_with(object: Arc<dyn Hittable>) -> Self {
+        let mut list = Self::new();
+        list.add(object);
+        list
+    }
+
+    pub fn clear(&mut self) {
+        self.objects.clear();
+    }
+
+    pub fn add(&mut self, object: Arc<dyn Hittable>) {
+        self.objects.push(object);
+    }
+}
+
+impl Hittable for HittableList {
+    fn hit(&self, r: &Ray, ray_t: Interval) -> Option<HitRecord> {
+        let mut closest_hitrecord: Option<HitRecord> = None;
+        let mut closest_so_far = ray_t.max;
+
+        for object in self.objects.iter() {
+            if let Some(hit_rec) = object.hit(r, Interval::new(ray_t.min, closest_so_far)) {
+                closest_so_far = hit_rec.t;
+                closest_hitrecord = Some(hit_rec);
+            }
+        }
+
+        closest_hitrecord
+    }
+}
+-e 
+
+=== interval.rs ===
+use crate::rtweekend::INFINITY;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Interval {
+    pub min: f64,
+    pub max: f64,
+}
+
+impl Interval {
+    pub fn new(min: f64, max: f64) -> Self {
+        Self { min, max }
+    }
+
+    pub fn size(&self) -> f64 {
+        self.max - self.min
+    }
+
+    pub fn contains(&self, x: f64) -> bool {
+        self.min <= x && x <= self.max
+    }
+
+    pub fn surrounds(&self, x: f64) -> bool {
+        self.min < x && x < self.max
+    }
+
+    pub const EMPTY: Self = Self {
+        min: INFINITY,
+        max: -INFINITY,
+    };
+
+    pub const UNIVERSE: Self = Self {
+        min: -INFINITY,
+        max: INFINITY,
+    };
+
+    pub fn clamp(&self, x: f64) -> f64 {
+        if x < self.min {
+            self.min
+        } else if x > self.max {
+            self.max
+        } else {
+            x
+        }
+    }
+}
+
+impl Default for Interval {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+-e 
+
+=== main.rs ===
+mod camera;
+mod color;
+mod hittable;
+mod hittable_list;
+mod interval;
+mod material;
+mod ray;
+mod rtweekend;
+mod sphere;
+mod vec3;
+
+use crate::rtweekend::*;
+use std::io;
+use std::sync::Arc; // Make sure PI is available
+
+// Assuming your imports for Color, Point3, Vec3, Lambertian, Dielectric, Metal,
+// Sphere, HittableList, Camera, etc., are at the top of your main.rs
+
+fn main() -> io::Result<()> {
+    // --- Materials ---
+    // Ground
+    let material_ground_reflective_dark = Arc::new(Metal::new(Color::new(0.1, 0.1, 0.15), 0.05)); // Dark, slightly fuzzy mirror
+    // let material_ground_diffuse_dark = Arc::new(Lambertian::new(Color::new(0.05, 0.05, 0.05))); // Alternative very dark diffuse
+
+    // Primary Orbs
+    let material_large_glass = Arc::new(Dielectric::new(1.5)); // Standard glass
+    let material_large_metal_gold = Arc::new(Metal::new(Color::new(0.8, 0.6, 0.2), 0.0)); // Polished gold
+    let material_large_metal_silver = Arc::new(Metal::new(Color::new(0.01, 0.0, 0.6), 0.0)); // Slightly fuzzy silver
+
+    // Accent / Small Orbs
+    let material_diffuse_blue = Arc::new(Lambertian::new(Color::new(0.1, 0.2, 0.7)));
+    let material_diffuse_red = Arc::new(Lambertian::new(Color::new(0.7, 0.1, 0.1)));
+    let material_metal_copper_fuzzy = Arc::new(Metal::new(Color::new(0.7, 0.3, 0.1), 0.4));
+    let material_small_glass_bubbles = Arc::new(Dielectric::new(1.3)); // Slightly different IOR for variety
+    let material_glowing_emitter_placeholder = Arc::new(Lambertian::new(Color::new(0.9, 0.9, 0.7))); // Brighter diffuse to simulate glow
+
+    // --- World ---
+    let mut world = HittableList::new();
+
+    // Ground Plane (Large Sphere)
+    world.add(Arc::new(Sphere::new(
+        Point3::new(0.0, -1000.0, -1.0), // Y very low to make it flat
+        1000.0,
+        material_ground_reflective_dark.clone(), // Use clone for Arc if used elsewhere, or just pass
+    )));
+
+    // --- Primary Large Spheres ---
+    // Central Glass Orb
+    world.add(Arc::new(Sphere::new(
+        Point3::new(0.0, 1.0, 0.0),
+        1.0,
+        material_large_glass.clone(),
+    )));
+
+    // Left Gold Metal Orb
+    world.add(Arc::new(Sphere::new(
+        Point3::new(-4.0, 1.0, 0.0),
+        1.0,
+        material_large_metal_gold.clone(),
+    )));
+
+    // Right Silver Metal Orb
+    world.add(Arc::new(Sphere::new(
+        Point3::new(4.0, 1.0, 0.0),
+        1.0,
+        material_large_metal_silver.clone(),
+    )));
+
+    // --- Scattered Smaller Spheres ---
+    // This loop creates a field of smaller, randomly placed and materialized spheres.
+    // Adjust the range (-10 to 10) and density as desired.
+
+    let small_sphere_radius = 0.2;
+    for a in -3..3 {
+        for b in -3..3 {
+            let choose_mat = rand::random::<f64>(); // Using rand crate for random numbers
+            let center = Point3::new(
+                a as f64 + 0.9 * rand::random::<f64>(),
+                small_sphere_radius, // Place them just above the ground (y=0)
+                b as f64 + 0.9 * rand::random::<f64>(),
+            );
+
+            // Ensure small spheres don't overlap too much with the large ones
+            if (center - Point3::new(0.0, 1.0, 0.0)).length() > 1.0 + small_sphere_radius
+                && (center - Point3::new(-4.0, 1.0, 0.0)).length() > 1.0 + small_sphere_radius
+                && (center - Point3::new(4.0, 1.0, 0.0)).length() > 1.0 + small_sphere_radius
+            {
+                let sphere_material: Arc<dyn Material + Send + Sync>;
+                if choose_mat < 0.3 {
+                    // 30% diffuse
+                    let albedo = Color::random() * Color::random(); // Random diffuse color
+                    sphere_material = Arc::new(Lambertian::new(albedo));
+                } else if choose_mat < 0.6 {
+                    // 30% metal
+                    let albedo = Color::new(
+                        random_f64_range(0.5, 1.0),
+                        random_f64_range(0.5, 1.0),
+                        random_f64_range(0.5, 1.0),
+                    );
+                    let fuzz = random_f64_range(0.0, 0.5); // Using your utility if available, else rand::random
+                    sphere_material = Arc::new(Metal::new(albedo, fuzz));
+                } else if choose_mat < 0.8 {
+                    // 20% glass
+                    sphere_material = material_small_glass_bubbles.clone();
+                } else {
+                    // 20% "glowing" (brighter diffuse)
+                    sphere_material = material_glowing_emitter_placeholder.clone();
+                }
+                world.add(Arc::new(Sphere::new(
+                    center,
+                    small_sphere_radius,
+                    sphere_material,
+                )));
+            }
+        }
+    }
+
+    // --- Camera Settings ---
+    // High quality settings - WILL BE SLOW!
+    let aspect_ratio = 16.0 / 9.0;
+    let image_width: u32 = 600; // Higher resolution (e.g., 1920 or 2560)
+    let sample_per_pixel: u32 = 10; // Significantly more samples for AA and soft effects
+    // Consider 1000-5000 for "final" quality if you have patience
+    let max_depth: u32 = 10; // Good depth for complex interactions
+
+    // Camera positioning for a dramatic, slightly low angle shot
+    let vfov = 25.0; // A bit wider than your example, but not too extreme
+    let lookfrom = Point3::new(8.0, 2.5, 10.0); // Further back, slightly elevated, off to the side
+    let lookat = Point3::new(0.0, 0.5, 0.0); // Look towards the center of the large orbs, slightly above ground
+    let vup = Vec3::new(0.0, 1.0, 0.0);
+
+    // Depth of field settings - focus on one of the main orbs or a point between them
+    let defocus_angle = 0.8; // Subtle defocus, increase for more blur (e.g., 1.0 to 2.0)
+    let focus_dist = (lookfrom - Point3::new(0.0, 1.0, 0.0)).length(); // Focus on the central large sphere
+
+    let cam = Camera::new(
+        aspect_ratio,
+        image_width,
+        sample_per_pixel,
+        max_depth,
+        vfov,
+        lookfrom,
+        lookat,
+        vup,
+        defocus_angle,
+        focus_dist,
+    );
+
+    // --- Render ---
+    eprintln!("Starting render with high quality settings...");
+    eprintln!(
+        "Image Width: {}, Samples/Pixel: {}, Max Depth: {}",
+        image_width, sample_per_pixel, max_depth
+    );
+    cam.render(&world)?;
+    eprintln!("Render finished!");
+
+    Ok(())
+}
+
+// Make sure you have random utilities. If not, you can use the `rand` crate:
+// Add `rand = "0.8"` to your Cargo.toml
+// And `use rand::Rng;` in your file.
+// Then replace `rand::random::<f64>()` with `rand::thread_rng().gen::<f64>()`
+// and `rand::random_range(min, max)` with `rand::thread_rng().gen_range(min..max)`
+// Or adapt to your Vec3::random() and Vec3::random_range() if you have them.
+-e 
+
+=== material.rs ===
+use crate::rtweekend::*;
+
+pub trait Material: Send + Sync {
+    fn scatter(&self, r_in: &Ray, rec: &HitRecord) -> Option<(Ray, Color)>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NullMaterial;
+
+impl Material for NullMaterial {
+    fn scatter(&self, _r_in: &Ray, _rec: &HitRecord) -> Option<(Ray, Color)> {
+        // A null material typically absorbs all light or doesn't scatter
+        None
+    }
+}
+
+pub struct Lambertian {
+    albedo: Color,
+}
+
+impl Lambertian {
+    pub fn new(albedo: Color) -> Self {
+        Self { albedo }
+    }
+}
+
+impl Material for Lambertian {
+    fn scatter(&self, r_in: &Ray, rec: &HitRecord) -> Option<(Ray, Color)> {
+        let mut scatter_direction = rec.normal + Vec3::random_unit_vector();
+        if scatter_direction.near_zero() {
+            scatter_direction = rec.normal;
+        }
+        let scattered = Ray::new(rec.p, scatter_direction);
+        let attenuation = self.albedo;
+        Some((scattered, attenuation))
+    }
+}
+
+pub struct Metal {
+    albedo: Color,
+    fuzz: f64,
+}
+
+impl Metal {
+    pub fn new(albedo: Color, fuzz: f64) -> Self {
+        Self { albedo, fuzz }
+    }
+}
+
+impl Material for Metal {
+    fn scatter(&self, r_in: &Ray, rec: &HitRecord) -> Option<(Ray, Color)> {
+        let mut reflected = Vec3::reflect(&r_in.dir, &rec.normal);
+        reflected =
+            reflected.normalized() + (self.fuzz.min(1.0).max(0.0) * Vec3::random_unit_vector());
+        let scattered = Ray::new(rec.p, reflected);
+        let attenuation = self.albedo;
+
+        Some((scattered, attenuation))
+    }
+}
+
+pub struct Dielectric {
+    ir: f64,
+}
+
+impl Dielectric {
+    pub fn new(refrection_index: f64) -> Self {
+        Self {
+            ir: refrection_index,
+        }
+    }
+
+    pub fn reflanctance(cosine: f64, refraction_index: f64) -> f64 {
+        let mut r0 = (1.0 - refraction_index) / (1.0 + refraction_index);
+        r0 = r0 * r0;
+        r0 + (1.0 - r0) * (1.0 - cosine).powi(5)
+    }
+}
+
+impl Material for Dielectric {
+    fn scatter(&self, r_in: &Ray, rec: &HitRecord) -> Option<(Ray, Color)> {
+        let attenuation = Color::new(1.0, 1.0, 1.0);
+        let ri = if rec.front_face {
+            1.0 / self.ir
+        } else {
+            self.ir
+        };
+        let unit_direction = r_in.dir.normalized();
+
+        let cos_theta = rec.normal.dot(-unit_direction).min(1.0);
+        let sin_theta = (1.0 - cos_theta * cos_theta).sqrt();
+        let cant_refract = { ri * sin_theta > 1.0 };
+        let direction: Vec3;
+
+        if cant_refract || Dielectric::reflanctance(cos_theta, ri) > random_f64() {
+            direction = Vec3::reflect(&unit_direction, &rec.normal);
+        } else {
+            direction = Vec3::refract(&unit_direction, &rec.normal, ri);
+        }
+
+        let scattered = Ray::new(rec.p, direction);
+
+        Some((scattered, attenuation))
+    }
+}
+-e 
+
+=== ray.rs ===
+use crate::rtweekend::*;
+
+#[derive(Debug, Copy, Clone, PartialEq, Default)]
+pub struct Ray {
+    pub orig: Point3,
+    pub dir: Vec3,
+}
+
+impl Ray {
+    pub fn new(origin: Point3, direction: Vec3) -> Self {
+        Self {
+            orig: origin,
+            dir: direction,
+        }
+    }
+
+    pub fn at(&self, t: f64) -> Point3 {
+        self.orig + t * self.dir
+    }
+}
+-e 
+
+=== rtweekend.rs ===
+pub use crate::camera::Camera;
+pub use crate::color::{Color, write_color};
+pub use crate::hittable::{HitRecord, Hittable};
+pub use crate::hittable_list::HittableList;
+pub use crate::interval::Interval;
+pub use crate::material::{Dielectric, Lambertian, Material, Metal, NullMaterial};
+pub use crate::ray::Ray;
+pub use crate::sphere::Sphere;
+pub use crate::vec3::{Point3, Vec3};
+
+use rand::prelude::*;
+pub use std::sync::Arc;
+
+pub const INFINITY: f64 = f64::INFINITY;
+pub const PI: f64 = std::f64::consts::PI;
+
+#[inline]
+pub fn degrees_to_radians(degrees: f64) -> f64 {
+    degrees * PI / 180.0
+}
+
+#[inline]
+pub fn random_f64() -> f64 {
+    let mut rng = rand::rng();
+    rng.random::<f64>()
+}
+
+#[inline]
+pub fn random_f64_range(min: f64, max: f64) -> f64 {
+    min + (max - min) * random_f64()
+}
+-e 
+
+=== sphere.rs ===
+use crate::rtweekend::*;
+
+pub struct Sphere {
+    pub center: Point3,
+    pub radius: f64,
+    pub mat: Arc<dyn Material + Send + Sync>,
+}
+
+impl Sphere {
+    pub fn new(center: Point3, radius: f64, mat: Arc<dyn Material + Send + Sync>) -> Self {
+        Self {
+            center,
+            radius,
+            mat,
+        }
+    }
+}
+
+impl Hittable for Sphere {
+    fn hit(&self, r: &Ray, ray_t: Interval) -> Option<HitRecord> {
+        let oc = self.center - r.orig;
+        let a = r.dir.length_squared();
+        let h = r.dir.dot(oc);
+        let c = oc.length_squared() - self.radius * self.radius;
+
+        let discriminant = h * h - a * c;
+        if discriminant < 0.0 {
+            return None;
+        }
+
+        let sqrtd = discriminant.sqrt();
+
+        let mut root = (h - sqrtd) / a;
+        if !ray_t.surrounds(root) {
+            root = (h + sqrtd) / a;
+            if !ray_t.surrounds(root) {
+                return None;
+            }
+        }
+
+        let mut rec = HitRecord::default();
+        rec.t = root;
+        rec.p = r.at(rec.t);
+        rec.normal = (rec.p - self.center) / self.radius;
+        let outward_normal = (rec.p - self.center) / self.radius;
+        rec.set_face_normal(r, outward_normal);
+        rec.mat = self.mat.clone();
+
+        Some(rec)
+    }
+}
+-e 
+
+=== vec3.rs ===
+use crate::rtweekend::*;
+use std::fmt;
+use std::ops::{Add, AddAssign, Div, DivAssign, Index, IndexMut, Mul, MulAssign, Neg, Sub};
+
+#[derive(Debug, Copy, Clone, PartialEq, Default)]
+pub struct Vec3 {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl Vec3 {
+    pub fn new(x: f64, y: f64, z: f64) -> Self {
+        Self { x, y, z }
+    }
+
+    pub fn zero() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        }
+    }
+
+    pub fn near_zero(&self) -> bool {
+        let s = 1e-8;
+        self.x.abs() < s && self.y.abs() < s && self.z.abs() < s
+    }
+
+    pub fn length_squared(&self) -> f64 {
+        self.x * self.x + self.y * self.y + self.z * self.z
+    }
+
+    pub fn length(&self) -> f64 {
+        self.length_squared().sqrt()
+    }
+
+    pub fn dot(self, other: Self) -> f64 {
+        self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    pub fn cross(self, other: Self) -> Self {
+        Self {
+            x: self.y * other.z - self.z * other.y,
+            y: self.z * other.x - self.x * other.z,
+            z: self.x * other.y - self.y * other.x,
+        }
+    }
+
+    pub fn normalized(&self) -> Self {
+        *self / self.length()
+    }
+
+    pub fn random() -> Self {
+        Self {
+            x: random_f64(),
+            y: random_f64(),
+            z: random_f64(),
+        }
+    }
+
+    pub fn random_interval(min: f64, max: f64) -> Self {
+        Self {
+            x: random_f64_range(min, max),
+            y: random_f64_range(min, max),
+            z: random_f64_range(min, max),
+        }
+    }
+
+    pub fn random_in_unit_sphere() -> Self {
+        loop {
+            let p = Self::random_interval(-1.0, 1.0);
+            if p.length_squared() < 1.0 {
+                return p;
+            }
+        }
+    }
+
+    pub fn random_unit_vector() -> Self {
+        Self::random_in_unit_sphere().normalized()
+    }
+
+    pub fn random_on_hemisphere(normal: &Self) -> Self {
+        let on_unit_sphere = Self::random_unit_vector();
+        if on_unit_sphere.dot(*normal) > 0.0 {
+            on_unit_sphere
+        } else {
+            -on_unit_sphere
+        }
+    }
+
+    pub fn reflect(v: &Self, n: &Self) -> Self {
+        let scalar = v.dot(*n) * 2.0;
+        let projection = scalar * *n;
+        *v - projection
+    }
+
+    pub fn refract(uv: &Vec3, n: &Vec3, etai_over_etat: f64) -> Vec3 {
+        // Assumes TIR check has already been done and refraction is possible
+        let a = -(*uv);
+        let b = *n;
+        let cos_theta = a.dot(b).min(1.0);
+        let r_out_perp = etai_over_etat * (*uv + cos_theta * (*n));
+        // NO .abs() HERE
+        let r_out_parallel = -((1.0 - r_out_perp.length_squared()).sqrt()) * (*n);
+        r_out_perp + r_out_parallel
+    }
+
+    // pub fn refract(uv: &Self, n: &Self, etai_over_etat: f64) -> Self {
+    //     let cos_theta = ((-*uv).dot(*n)).min(1.0);
+    //     let r_out_perp = etai_over_etat * (*uv + cos_theta * *n);
+    //     let r_out_parallel = -(((1.0 - r_out_perp.length_squared()).abs()).sqrt()) * *n;
+    //     r_out_perp + r_out_parallel
+    //    }
+
+    pub fn random_in_unit_disk() -> Self {
+        loop {
+            let p = Vec3::new(
+                random_f64_range(-1.0, 1.0),
+                random_f64_range(-1.0, 1.0),
+                0.0,
+            );
+            if p.length_squared() < 1.0 {
+                return p;
+            }
+        }
+    }
+}
+
+impl Neg for Vec3 {
+    type Output = Self;
+
+    fn neg(self) -> Self::Output {
+        Self {
+            x: -self.x,
+            y: -self.y,
+            z: -self.z,
+        }
+    }
+}
+
+impl Add for Vec3 {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self::Output {
+        Self {
+            x: self.x + other.x,
+            y: self.y + other.y,
+            z: self.z + other.z,
+        }
+    }
+}
+
+impl AddAssign for Vec3 {
+    fn add_assign(&mut self, other: Self) {
+        self.x += other.x;
+        self.y += other.y;
+        self.z += other.z;
+    }
+}
+
+impl Sub for Vec3 {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self::Output {
+        Self {
+            x: self.x - other.x,
+            y: self.y - other.y,
+            z: self.z - other.z,
+        }
+    }
+}
+
+impl Mul for Vec3 {
+    type Output = Self;
+
+    fn mul(self, other: Self) -> Self::Output {
+        Self {
+            x: self.x * other.x,
+            y: self.y * other.y,
+            z: self.z * other.z,
+        }
+    }
+}
+
+impl Mul<f64> for Vec3 {
+    type Output = Self;
+
+    fn mul(self, scalar: f64) -> Self::Output {
+        Self {
+            x: self.x * scalar,
+            y: self.y * scalar,
+            z: self.z * scalar,
+        }
+    }
+}
+
+impl Mul<Vec3> for f64 {
+    type Output = Vec3;
+
+    fn mul(self, vec: Vec3) -> Self::Output {
+        vec * self
+    }
+}
+
+impl MulAssign<f64> for Vec3 {
+    fn mul_assign(&mut self, scalar: f64) {
+        self.x *= scalar;
+        self.y *= scalar;
+        self.z *= scalar;
+    }
+}
+
+impl Div<f64> for Vec3 {
+    type Output = Self;
+
+    fn div(self, scalar: f64) -> Self::Output {
+        self * (1.0 / scalar)
+    }
+}
+
+impl DivAssign<f64> for Vec3 {
+    fn div_assign(&mut self, scalar: f64) {
+        *self *= 1.0 / scalar;
+    }
+}
+
+impl Index<usize> for Vec3 {
+    type Output = f64;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        match index {
+            0 => &self.x,
+            1 => &self.y,
+            2 => &self.z,
+            _ => panic!("Index out of bounds for Vec3"),
+        }
+    }
+}
+
+impl IndexMut<usize> for Vec3 {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        match index {
+            0 => &mut self.x,
+            1 => &mut self.y,
+            2 => &mut self.z,
+            _ => panic!("Index out of bounds for Vec3"),
+        }
+    }
+}
+
+impl fmt::Display for Vec3 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {} {}", self.x, self.y, self.z)
+    }
+}
+
+pub type Point3 = Vec3;
+-e 
+

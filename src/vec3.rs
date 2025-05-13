@@ -80,7 +80,7 @@ impl Vec3 {
         Self::random_in_unit_sphere().normalized()
     }
 
-    pub fn random_on_hemisphere(normal: &Vec3) -> Self {
+    pub fn random_on_hemisphere(normal: &Self) -> Self {
         let on_unit_sphere = Self::random_unit_vector();
         if on_unit_sphere.dot(*normal) > 0.0 {
             on_unit_sphere
@@ -89,10 +89,41 @@ impl Vec3 {
         }
     }
 
-    pub fn reflect(v: &Vec3, n: &Vec3) -> Vec3 {
+    pub fn reflect(v: &Self, n: &Self) -> Self {
         let scalar = v.dot(*n) * 2.0;
         let projection = scalar * *n;
         *v - projection
+    }
+
+    pub fn refract(uv: &Vec3, n: &Vec3, etai_over_etat: f64) -> Vec3 {
+        // Assumes TIR check has already been done and refraction is possible
+        let a = -(*uv);
+        let b = *n;
+        let cos_theta = a.dot(b).min(1.0);
+        let r_out_perp = etai_over_etat * (*uv + cos_theta * (*n));
+        // NO .abs() HERE
+        let r_out_parallel = -((1.0 - r_out_perp.length_squared()).max(0.0).sqrt()) * (*n);
+        r_out_perp + r_out_parallel
+    }
+
+    // pub fn refract(uv: &Self, n: &Self, etai_over_etat: f64) -> Self {
+    //     let cos_theta = ((-*uv).dot(*n)).min(1.0);
+    //     let r_out_perp = etai_over_etat * (*uv + cos_theta * *n);
+    //     let r_out_parallel = -(((1.0 - r_out_perp.length_squared()).abs()).sqrt()) * *n;
+    //     r_out_perp + r_out_parallel
+    //    }
+
+    pub fn random_in_unit_disk() -> Self {
+        loop {
+            let p = Vec3::new(
+                random_f64_range(-1.0, 1.0),
+                random_f64_range(-1.0, 1.0),
+                0.0,
+            );
+            if p.length_squared() < 1.0 {
+                return p;
+            }
+        }
     }
 }
 
